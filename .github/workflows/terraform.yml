@@ -1,0 +1,119 @@
+name: Terraform · Banco de Dados Gerenciado
+
+on:
+  push:
+    branches: [main, homolog]
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: [main, homolog]
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: 'Executar terraform destroy em vez de apply'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.9.8
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Validar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Formatacao
+        run: terraform fmt -check -recursive
+
+      - name: Init sem backend
+        run: terraform init -backend=false
+
+      - name: Validar
+        run: terraform validate
+
+  plan:
+    name: Plan
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - run: terraform init -input=false
+
+      - name: Plan
+        id: plan
+        run: terraform plan -input=false -no-color -out=tfplan 2>&1 | tee plan.txt
+
+      - name: Comentar o plan no PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const body = `#### Terraform Plan — Banco de Dados\n\n<details><summary>Ver plano</summary>\n\n\`\`\`hcl\n${plan.slice(-60000)}\n\`\`\`\n\n</details>`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  apply:
+    name: Apply
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - run: terraform init -input=false
+
+      - name: Apply
+        if: ${{ !inputs.destroy }}
+        run: terraform apply -input=false -auto-approve
+
+      - name: Destroy
+        if: ${{ inputs.destroy }}
+        run: terraform destroy -input=false -auto-approve
+
+      - name: Publicar outputs
+        if: ${{ !inputs.destroy }}
+        run: |
+          echo "### Banco provisionado" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output -json | jq -r 'to_entries[] | "\(.key) = \(.value.value)"' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
